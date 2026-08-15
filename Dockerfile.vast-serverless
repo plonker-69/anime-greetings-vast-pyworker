@@ -1,0 +1,244 @@
+# Vast SERVERLESS worker for the InfiniteTalk + CosyVoice pipeline —
+# LIGHTWEIGHT + BLACKWELL-ONLY variant (RTX 50-series / B100 / B200, no
+# baked-in models).
+#
+# This file is a direct fork of Dockerfile.lightweight-blackwell — same
+# SageAttention compile, same custom-node list and pinned commits, same
+# HuggingFace fetch-at-boot model strategy, copied line-for-line. The
+# ONLY substantive change is at the very bottom: what the container runs
+# when it starts. Everything above the "--- Vast Serverless entrypoint
+# ---" marker should be kept in sync BY HAND with Dockerfile.lightweight-
+# blackwell if that file changes — same rule that file already applies to
+# its own two parents (Dockerfile.lightweight, Dockerfile.blackwell).
+#
+# STATUS: 2026-08-15, not yet built or tested (no Docker daemon available
+# to build with in the session that wrote this). Forked instead of
+# layered on top of a separately-built image on purpose, 2026-08-15 —
+# an earlier version of this file used `FROM $BASE_IMAGE` to build on top
+# of an already-pushed image instead of duplicating the SageAttention/
+# model-fetch logic here. That meant this file couldn't be built on its
+# own — you'd have to build and push Dockerfile.lightweight-blackwell
+# first, as a separate manual step, before this file would even start.
+# Every other Dockerfile* in this project is self-contained and buildable
+# on its own; this now matches that.
+#
+# --- What changed from Dockerfile.lightweight-blackwell, and why -------
+#
+# Dockerfile.lightweight-blackwell's own CMD (`python -u /handler.py`)
+# runs handler.py in RunPod's default queue-polling mode — it sits there
+# waiting for jobs to arrive from RunPod's own job queue, which a Vast
+# Serverless endpoint has no way to push into. Vast Serverless instead
+# expects a PyWorker process (worker.py, in this same folder) that
+# proxies HTTP requests to a locally-running model server. So this file's
+# CMD/ENTRYPOINT run vast-entrypoint.sh instead, which:
+#   1. runs fetch-models-entrypoint.sh directly (see vast-entrypoint.sh's
+#      own comments for why this is safe to call with no arguments — the
+#      short version: its trailing command line becomes a harmless no-op
+#      with nothing to run, so this still gets the real HuggingFace fetch
+#      without inheriting anything else that line would have done)
+#   2. starts handler.py in RunPod's *local hosted-API* mode
+#      (--rp_serve_api) instead of its default queue-polling mode
+#   3. hands off to Vast's own pyworker bootstrap (start_server.sh,
+#      vendored in this folder), which runs worker.py
+# See serverless/vast_pyworker/README.md for the full design writeup and
+# ../../HANDOFF.md's 2026-08-15 "Vast Serverless" sections for how this
+# was arrived at and tested (without real GPU hardware — see "Not yet
+# verified" below).
+#
+# worker.py, requirements.txt, and benchmark_payload.json are NOT baked
+# into this image — they're cloned at container BOOT (not build) time by
+# start_server.sh, from whichever git repo PYWORKER_REPO points at on the
+# Vast endpoint/template config. Push this folder's contents there
+# separately; see the README's "Setup steps" §1.
+#
+# --- A real, unresolved risk worth reading before deploying this -------
+#
+# `auto-fetch-models.sh` (in this project, wired in below the same as
+# Dockerfile.lightweight-blackwell) exists because of something already
+# confirmed on real rented Vast hardware, 5 boxes in a row, 2026-08-14:
+# a custom Docker image's own ENTRYPOINT does not reliably run when Vast
+# deploys it. That finding is from Vast's regular on-demand GPU rental
+# flow (rent a box, SSH in) — auto-fetch-models.sh's fix for it is an
+# SSH-login trigger (/etc/profile.d), which has no equivalent for a Vast
+# SERVERLESS worker: nothing logs in, there's no shell to fire from.
+#
+# UPDATE, 2026-08-15, after actually reading Vast's own docs (not just
+# inferring from a code comment — see HANDOFF.md for the full citation
+# list): the "ENTRYPOINT doesn't run" finding is explained, in Vast's own
+# words. docs.vast.ai/instances/launch-modes and
+# docs.vast.ai/documentation/templates/template-settings both confirm
+# regular instances have a per-template Launch Mode: "Docker ENTRYPOINT"
+# mode runs the image exactly as built; "SSH"/"Jupyter" modes explicitly
+# state "the docker entrypoint for your image will not be run — it will
+# be replaced with our instance setup script." That's an intentional,
+# documented platform behavior, not an undocumented quirk — the 5/5-boxes
+# finding is almost certainly boxes that were on SSH or Jupyter launch
+# mode (the default/common choice for an interactive rental), not a
+# platform-wide inability to run ENTRYPOINT at all.
+#
+# For Serverless specifically: docs.vast.ai/guides/serverless/
+# creating-new-pyworkers.md describes the worker boot sequence as "the
+# start-server script (provided by the template)" doing exactly four
+# things — clone PYWORKER_REPO, install requirements.txt, start the model
+# server, run worker.py — which is precisely what vast-entrypoint.sh +
+# the vendored start_server.sh already do here. That page never mentions
+# ENTRYPOINT, CMD, or Launch Mode at all (checked verbatim, not just
+# summarized) — Serverless templates don't appear to expose the
+# Jupyter/SSH/ENTRYPOINT selector regular instances have, which is
+# consistent with (though not an explicit statement of) Serverless always
+# running the image as declared. This is now well-supported by primary
+# sources, not just plausible inference — but no page states outright
+# "Serverless always honors ENTRYPOINT," so it's still worth checking on
+# the first real deploy: does vast-entrypoint.sh's first log line
+# ("[vast-entrypoint] fetch-at-boot image detected...") ever show up? If
+# it doesn't, come back to this comment and HANDOFF.md before spending
+# more build time.
+#
+# Separately noted, not yet acted on: Vast also documents a newer,
+# Python-SDK-based Serverless deployment path (app.image()/.run_script()/
+# app.ensure_ready(), see docs.vast.ai/guides/serverless/deployments/
+# configuration.md) that sidesteps hand-written Dockerfiles entirely. This
+# project still uses the classic PYWORKER_REPO + template-env-var path
+# vast-ai/pyworker's own README documents — that path is still current and
+# documented, just not the only one Vast now offers. Not investigated
+# further; flagging in case it's worth revisiting.
+
+FROM nextdiffusionai/comfyui-sageattention:cuda12.8-v1
+
+# Base image doesn't include ffmpeg — required by VHS_VideoCombine and for
+# duration measurement. (Same fix as every other Dockerfile in this repo.)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Same absolute path as the pod (/workspace/ComfyUI) — matches
+# handler.py's default and keeps every relative path below short.
+WORKDIR /workspace/ComfyUI
+
+# --- ComfyUI core: pinned to the exact commit confirmed on the pod -------
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git . \
+ && git checkout b7ba504e0614f81549f7b05cece271ed5d91bc9a \
+ && python -m pip install --no-cache-dir -r requirements.txt
+
+# --- SageAttention: compiled from source, baked into image layers ---------
+# Same pre-flight rationale as every other Dockerfile here — see
+# Dockerfile's extensive comments for the full story, not duplicated here.
+RUN python -c "\
+import torch, subprocess; \
+print('=== SageAttention build pre-flight ==='); \
+print('torch.__version__      :', torch.__version__); \
+print('torch.version.cuda     :', torch.version.cuda); \
+from torch.utils.cpp_extension import CUDA_HOME; \
+print('CUDA_HOME (build)      :', CUDA_HOME); \
+assert torch.version.cuda is not None, 'torch is a CPU-only build -- nothing to compile SageAttention against.'; \
+assert CUDA_HOME is not None, 'CUDA_HOME not found -- base image only ships CUDA runtime libs, not the build toolkit.'; \
+subprocess.run([CUDA_HOME + '/bin/nvcc', '--version'], check=True); \
+"
+
+# --- The one line that makes this file Blackwell-only instead of Ampere+Ada
+# Blackwell only, deliberately alone — same reasoning as Dockerfile.blackwell
+# (SageAttention's Hopper kernel + untested arch-combination risk, see that
+# file's header comment for the full story, not repeated here).
+ENV TORCH_CUDA_ARCH_LIST="12.0"
+ENV EXT_PARALLEL=1
+# MAX_JOBS=2, not Dockerfile.lightweight's 1 — genuine single-architecture
+# compile here, same shape as Dockerfile.blackwell's proven single-arch
+# build (~24 min at MAX_JOBS=2 for the equivalent 8.9 test, per
+# Dockerfile.sageattention-test's history). Drop to 1 first if this OOMs
+# before assuming anything more exotic is wrong.
+RUN python -m pip install --no-cache-dir ninja \
+ && git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention \
+ && git -C /tmp/SageAttention checkout d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5 \
+ && MAX_JOBS=2 python -m pip install --no-cache-dir --no-build-isolation /tmp/SageAttention \
+ && rm -rf /tmp/SageAttention \
+ && python -c "import sageattention; print('sageattention import OK:', sageattention.__file__)"
+
+RUN mkdir -p custom_nodes
+
+# --- comfyui-manager: pinned to the exact commit confirmed on the pod ----
+RUN git clone https://github.com/ltdrdata/ComfyUI-Manager.git custom_nodes/comfyui-manager \
+ && git -C custom_nodes/comfyui-manager checkout ab8ce7814aa1cd4f9a88b7b0313f64395f132972 \
+ && python -m pip install --no-cache-dir -r custom_nodes/comfyui-manager/requirements.txt
+
+# --- TTS-Audio-Suite: pinned commit, real installer (not bare pip install)
+RUN git clone https://github.com/diodiogod/TTS-Audio-Suite.git custom_nodes/TTS-Audio-Suite \
+ && git -C custom_nodes/TTS-Audio-Suite checkout 127bfe32fc83bedf36009ac35728098992460771 \
+ && cd custom_nodes/TTS-Audio-Suite && python install.py
+
+# --- The five nodes with no pod-side git metadata: real repos, current
+# main HEAD (see Dockerfile's header comment for the full risk).
+RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git custom_nodes/ComfyUI-WanVideoWrapper \
+ && python -m pip install --no-cache-dir -r custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
+
+RUN git clone https://github.com/kijai/ComfyUI-MelBandRoFormer.git custom_nodes/ComfyUI-MelBandRoFormer \
+ && python -m pip install --no-cache-dir -r custom_nodes/ComfyUI-MelBandRoFormer/requirements.txt
+
+RUN git clone https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git custom_nodes/comfyui_fl-cosyvoice3 \
+ && python -m pip install --no-cache-dir -r custom_nodes/comfyui_fl-cosyvoice3/requirements.txt
+
+RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes \
+ && python -m pip install --no-cache-dir -r custom_nodes/comfyui-kjnodes/requirements.txt
+
+RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git custom_nodes/comfyui-videohelpersuite \
+ && python -m pip install --no-cache-dir -r custom_nodes/comfyui-videohelpersuite/requirements.txt
+
+# This worker is headless and API-driven — it never uses ComfyUI-Manager's
+# UI to install nodes at runtime — so its startup registry fetch is pure
+# waste. Confirmed on RunPod: ~2 minutes of every cold start.
+RUN mkdir -p user/__manager && \
+    printf '[default]\nnetwork_mode = offline\n' > user/__manager/config.ini
+
+# --- Model weights: NOT baked in, on purpose -------------------------------
+# Same as Dockerfile.lightweight — this is the entire point of the
+# "lightweight" half of this file's name. No COPY of ComfyUI-models
+# anywhere; fetch-models.py pulls everything from HuggingFace at boot.
+#
+# Same correction as Dockerfile.lightweight, 2026-08-13: no `[hf_transfer]`
+# extra / HF_HUB_ENABLE_HF_TRANSFER here anymore -- that's dead, the Hub is
+# fully Xet-backed now and hf-xet ships as a hard dependency on its own.
+# HF_XET_HIGH_PERFORMANCE=1 baked in below, same as Dockerfile.lightweight
+# -- confirmed 2026-08-13 that Vast's rentable fleet (5090/B100/B200 for
+# this file specifically) isn't RAM-starved at the 64GB+ level this flag
+# wants. See Dockerfile.lightweight's comment at this same spot for the
+# full citation, and README's "Maximizing HF-fetch speed" section for
+# HF_TOKEN, which stays a runtime-only env var, not baked in here either.
+RUN python -m pip install --no-cache-dir "huggingface_hub>=0.32.0"
+ENV HF_XET_HIGH_PERFORMANCE=1
+
+RUN pip install --no-cache-dir runpod
+
+COPY handler.py /handler.py
+COPY workflow_api.json /workflow_api.json
+
+ENV COMFY_ROOT=/workspace/ComfyUI
+ENV COMFY_SKIP_REQ_SYNC=1
+
+# --- Boot-time model fetch + per-line timing ---------------------------
+# Identical wiring to Dockerfile.lightweight-blackwell: fetch-models.py
+# downloads every model from HuggingFace, log-timestamps.py gives every
+# boot per-line elapsed-time numbers — see README's "Measuring every
+# step" section. vast-entrypoint.sh (below) calls fetch-models-
+# entrypoint.sh directly rather than relying on it as ENTRYPOINT, so this
+# COPY is still needed but the file is invoked differently than in the
+# parent Dockerfile.
+COPY fetch-models.py /fetch-models.py
+COPY fetch-models-entrypoint.sh /fetch-models-entrypoint.sh
+RUN chmod +x /fetch-models-entrypoint.sh
+COPY log-timestamps.py /log-timestamps.py
+
+# auto-fetch-models.sh (SSH-login fallback) is NOT copied into this image
+# — it fires from /etc/profile.d on an interactive login shell, and a
+# Vast Serverless worker has no login shell for anything to fire from.
+# See the "real, unresolved risk" comment near the top of this file for
+# why that fallback existing at all for the parent image is worth reading
+# before deploying this one.
+
+# --- Vast Serverless entrypoint -----------------------------------------
+# Only lines in this file that differ from Dockerfile.lightweight-
+# blackwell's own ENTRYPOINT/CMD. See vast-entrypoint.sh's own comments
+# for the full boot sequence it runs.
+COPY serverless/vast_pyworker/start_server.sh /start_server.sh
+COPY serverless/vast_pyworker/vast-entrypoint.sh /vast-entrypoint.sh
+RUN chmod +x /start_server.sh /vast-entrypoint.sh
+
+ENTRYPOINT ["/vast-entrypoint.sh"]
+CMD []

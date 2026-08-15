@@ -1,0 +1,12 @@
+# Deps for worker.py itself (installed by start_server.sh via `uv pip install
+# -r requirements.txt`, into the venv/system-python it sets up -- NOT the
+# same Python environment handler.py/ComfyUI run in).
+#
+# `vastai` is the current package (the framework providing Worker,
+# WorkerConfig, HandlerConfig, BenchmarkConfig, LogActionConfig -- see
+# worker.py). The official pyworker examples pin `vastai-sdk>=0.3.0`
+# instead; as of 2026-08 that name is a deprecated compatibility shim
+# ("DEPRECATED — use 'pip install vastai' instead") that just installs
+# `vastai` as a dependency, confirmed by downloading both wheels from PyPI.
+# Depending on `vastai` directly avoids the extra indirection.
+vastai>=1.5.0
