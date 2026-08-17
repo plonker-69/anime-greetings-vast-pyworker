@@ -101,13 +101,32 @@ MODEL_LOAD_LOG_MSG = [
 # as normal -- the gap is specifically the startup benchmark's own brief
 # window, not a standing blind spot.
 MODEL_ERROR_LOG_MSGS = [
-    "[handler] ERROR: job failed",
-    "Traceback (most recent call last):",
+    # NOTE, 2026-08-16: this list used to also include
+    # "[handler] ERROR: job failed", "Traceback (most recent call last):",
+    # and "Value not in list: ". All three were too broad -- they match
+    # request-level/recoverable failures (a single bad job, a workflow
+    # validation error) and, worse, ComfyUI's own benign, caught-and-
+    # continued custom-node-import tracebacks (confirmed: KJNodes' MiniMax
+    # nodes failing to import with a non-fatal ModuleNotFoundError was
+    # enough to trip "Traceback (most recent call last):" and get a
+    # perfectly healthy worker destroyed by Vast). This list should only
+    # contain genuinely unrecoverable *worker*-health conditions -- a bad
+    # job should fail and return an error, leaving the warm worker
+    # available for the next request, not get the whole box destroyed.
     "CUDA out of memory",
     "torch.cuda.OutOfMemoryError",
-    "Value not in list: ",
-    "ComfyUI did not come up within",
-    "ComfyUI exited with code",
+    # Explicit, deliberate sentinel handler.py prints from BOTH start_comfy()
+    # call sites -- _boot_comfy_or_die (the eager initial-boot thread) and
+    # handler(job)'s wrapped restart-on-request call -- whenever start_comfy()
+    # itself raises. Superseded "ComfyUI did not come up within"/"ComfyUI
+    # exited with code" as of 2026-08-16: those were substring-matching
+    # exception text wherever it happened to leak into the log (the initial
+    # boot's uncaught-thread-exception dump, or falling through to the
+    # generic "[handler] ERROR: job failed" print on a restart failure).
+    # Now handler.py classifies "ComfyUI itself is broken" explicitly at
+    # both call sites instead of worker.py inferring it from message text,
+    # so both old patterns are fully covered by this one sentinel.
+    "[handler] FATAL_WORKER:",
 ]
 
 MODEL_INFO_LOG_MSGS = [

@@ -77,11 +77,22 @@ LOG_DIR="/var/log/vast-pyworker"
 mkdir -p "$LOG_DIR"
 
 echo "[vast-entrypoint] starting handler.py in --rp_serve_api mode"
+# Note: output is duplicated to both the log file AND this container's own
+# stdout (via process substitution + tee, not a plain pipe -- a plain pipe
+# would make $! below capture tee's PID instead of handler.py's, breaking
+# the immediate-crash check right after this). This is deliberate: worker.py
+# only relays specific whitelisted log-line patterns from handler.log into
+# `vastai logs` (its own "Info from model logs:" / "Got log line indicating
+# error:" wrapper), which silently swallows anything else -- including a
+# real Python traceback's actual stack frames, past the first "Traceback
+# (most recent call last):" line. Tee-ing straight to stdout means
+# `vastai logs <instance_id>` shows the raw, complete output no matter what
+# worker.py does or doesn't forward -- see HANDOFF.md, 2026-08-16.
 python3 -u /handler.py \
     --rp_serve_api \
     --rp_api_host 127.0.0.1 \
     --rp_api_port 8000 \
-    >> "$LOG_DIR/handler.log" 2>&1 &
+    > >(tee -a "$LOG_DIR/handler.log") 2>&1 &
 HANDLER_PID=$!
 echo "[vast-entrypoint] handler.py pid=$HANDLER_PID, logging to $LOG_DIR/handler.log"
 
