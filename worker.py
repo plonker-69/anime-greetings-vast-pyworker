@@ -45,8 +45,10 @@ benchmark step below is what actually proves generation works, once, at
 boot.
 """
 
+import copy
 import json
 import os
+import random
 
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
@@ -146,7 +148,46 @@ MODEL_INFO_LOG_MSGS = [
 _BENCHMARK_PAYLOAD_PATH = os.path.join(os.path.dirname(__file__), "benchmark_payload.json")
 with open(_BENCHMARK_PAYLOAD_PATH) as _f:
     _benchmark_request = json.load(_f)  # {"input": {"workflow": ..., "files": [...]}}
-benchmark_dataset = [_benchmark_request]
+
+# Node ids of the two seeded samplers in the benchmark workflow -- mirrors
+# worker/workflow.py's NODE["SAMPLER"] / NODE["TTS"]; keep in sync if the
+# graph changes (both templates are kept in lockstep, see that file's
+# module docstring).
+_BENCHMARK_SAMPLER_NODE = "128"  # WanVideoSampler
+_BENCHMARK_TTS_NODE = "318"      # FL_CosyVoice3_CrossLingual
+
+
+def _make_benchmark_payload() -> dict:
+    """Fresh copy of the benchmark request with a new random seed on both
+    samplers, every call.
+
+    HANDOFF.md bug this fixes ("Fix the Vast benchmark before it serves
+    real traffic"): ComfyUI caches node outputs by input hash within the
+    same running process, and `do_warmup=True` below submits this payload
+    TWICE on boot -- once to force the model into VRAM (warmup), once as
+    the "measured" run Vast's autoscaler uses to size this worker's
+    throughput. With a static payload (the old `dataset=[_benchmark_request]`
+    below) the second submission is byte-for-byte identical to the first,
+    so WanVideoSampler and the CosyVoice node just replay their cached
+    output instead of generating -- the measured run clocked in ~41x
+    faster than a real request, and the autoscaler never scaled the fleet
+    up under load.
+
+    Passing BenchmarkConfig a `generator` instead of a `dataset` gets this
+    function called fresh for every submission, warmup included (see
+    vastai's GenericApiPayload.for_test(): `dataset` is drawn from via
+    random.choice -- a fixed pool that can and does repeat -- `generator`
+    is invoked new each time). Randomizing both seeds on every call
+    guarantees no two submissions in one boot share a seed, so the
+    "measured" run always does a real, cache-miss generation -- matching
+    how worker/workflow.py's build_workflow() already randomizes seeds for
+    every real order.
+    """
+    payload = copy.deepcopy(_benchmark_request)
+    workflow = payload["input"]["workflow"]
+    workflow[_BENCHMARK_SAMPLER_NODE]["inputs"]["seed"] = random.randrange(2**31)
+    workflow[_BENCHMARK_TTS_NODE]["inputs"]["seed"] = random.randrange(2**31)
+    return payload
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
@@ -173,7 +214,7 @@ worker_config = WorkerConfig(
             # load.
             max_queue_time=3600.0,
             benchmark_config=BenchmarkConfig(
-                dataset=benchmark_dataset,
+                generator=_make_benchmark_payload,
                 runs=1,
                 # allow_parallel_requests=False above forces the
                 # benchmark's own concurrency to 1 regardless of this
@@ -194,6 +235,37 @@ worker_config = WorkerConfig(
             # (workers/wan/worker.py uses a flat 10000.0): this pipeline's
             # cost doesn't scale with an easily-read request field the way
             # LLM token counts do.
+            #
+            # ⚠️ CONTRACT, 2026-08-27 -- this number is HALF of a pair. Every
+            # client that submits to this endpoint must declare the SAME
+            # number as its /route/ `cost`:
+            #   ../../smoketest.py            -> VAST_REQUEST_COST
+            #   ../../../worker/adapters.py   -> VastBackend(cost=...)
+            #   testing/run_i2v_batch.py      -> VAST_REQUEST_COST
+            # The two halves are one currency. The startup benchmark reports
+            # this worker's throughput to the autoscaler as
+            #   max_perf = (this number) / (seconds per generation)
+            # i.e. 10000 / ~174s ~= 57 perf units/s. `cost` is the only signal
+            # telling the autoscaler how much work an arriving request is
+            # ("the estimated compute resources for the request", per Vast's
+            # /route/ API reference). Mismatch them and the endpoint's
+            # utilisation and queue-time maths are wrong by exactly that
+            # ratio: with cost=100 against this 10000, a real 266s backlog
+            # scored as ~1.7s of work, ~1% utilisation against target_util
+            # 0.9, and the endpoint sat flat at one worker forever. That was
+            # the "won't scale past 1 worker" bug -- see HANDOFF.md 2026-08-27.
+            #
+            # Vast's own reference workers pair these explicitly (tgi/openai:
+            # cost=max_tokens vs workload_calculator=max_tokens; comfyui-json:
+            # COST=100 vs a 100.0 calculator). Their wan example -- the source
+            # of this 10000.0 -- omits cost client-side and therefore ships
+            # the same 100x mismatch. Don't copy its client.
+            #
+            # Changing this value invalidates any cached benchmark score:
+            # backend.__run_benchmark writes max_perf to `.has_benchmark` in
+            # $SERVER_DIR (/workspace/vast-pyworker) and short-circuits on it,
+            # so an instance restarted in place keeps the OLD units. Recruit
+            # fresh instances (or delete that file) rather than restarting.
             workload_calculator=lambda _: 10000.0,
         )
     ],
