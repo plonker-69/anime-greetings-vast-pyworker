@@ -63,6 +63,35 @@
 
 set -euo pipefail
 
+# Boot forensics FIRST, before the model fetch, so its output frames every
+# later line: was this a container restart or a recreate, did the kernel
+# OOM-kill anything in this cgroup last time, and what did memory look like in
+# the seconds before the previous run died. Best-effort by design -- guarded
+# with `|| true` under `set -e` so a diagnostic can never be the reason a
+# worker fails to boot. See boot-forensics.sh's header and HANDOFF.md.
+#
+# NOTE 2026-08-29: these are TWO DIFFERENT FAULTS, not one -- an earlier
+# version of this comment said "one bug" and that linkage is withdrawn.
+#   - 2026-08-24 long-clip death: RESOLVED. Client-side idle TCP connection
+#     reap, fixed with OS keepalives; 56 clips have since completed, longest
+#     953.6s. Nothing here diagnoses it because there is nothing left to
+#     diagnose.
+#   - 2026-08-27 container restart: still UNEXPLAINED. Proven Docker-level
+#     by a PID reset (422 -> 59, so a new PID namespace). No leading cause;
+#     host RAM is neither established nor excluded. This is what the
+#     forensics below are actually for.
+# Both calls are plain SUBPROCESSES on purpose, not `source`: errexit is not
+# inherited across a fork+exec, so nothing in the diagnostic can trip this
+# script's own `set -e`. The sampler still outlives boot-forensics.sh -- it is
+# backgrounded, orphaned when that script exits, and reparented to whatever
+# becomes PID 1 (start_server.sh, via the exec at the end of this file).
+if [ -x /boot-forensics.sh ]; then
+    /boot-forensics.sh boot || true
+    /boot-forensics.sh sampler || true
+else
+    echo "[vast-entrypoint] boot-forensics.sh not present on this image -- skipping"
+fi
+
 if [ -x /reassemble-models.sh ]; then
     echo "[vast-entrypoint] baked-model image detected -- running reassemble-models.sh"
     /reassemble-models.sh

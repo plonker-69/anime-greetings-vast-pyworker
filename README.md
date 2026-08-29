@@ -36,6 +36,7 @@ something Vast-shaped instead of RunPod's own queue poller.
 | `benchmark_payload.json` | Copy of `../../smoke_test_payload_5090.json` -- a real portrait+voice request. Doubles as the worker's boot-time correctness check and its throughput sample. |
 | `start_server.sh` | Vendored verbatim from `vast-ai/pyworker` (not written by us -- see "What this actually does" below). Clones `PYWORKER_REPO`, installs `requirements.txt`, runs `worker.py`. |
 | `vast-entrypoint.sh` | New, ours. Container `ENTRYPOINT` for Vast: runs the right model pre-step, starts `handler.py --rp_serve_api` in the background, then hands off to `start_server.sh`. |
+| `boot-forensics.sh` | New, ours. Boot counter, cgroup OOM-kill counter and a background memory sampler, run from `vast-entrypoint.sh`. Makes a silent container death diagnosable without SSH -- see "Boot forensics" below. |
 | `Dockerfile.vast-serverless` | New, ours. **A direct, self-contained fork of `../../Dockerfile.lightweight-blackwell`** -- same base image, same SageAttention compile, same custom-node list and pins, same HF-fetch-at-boot model strategy, copied line-for-line, with only the final `ENTRYPOINT`/`CMD` lines changed to run `vast-entrypoint.sh` instead. Not a wrapper around a separately-built image (see Setup steps §2 for why that changed 2026-08-15). Not baked in: `worker.py`/`requirements.txt`/`benchmark_payload.json` -- those are cloned at container boot from `PYWORKER_REPO`, not at image build time. |
 
 ## How the pieces fit together, end to end
@@ -217,6 +218,54 @@ set explicitly.
 `handler.py`'s own existing env vars (`COMFY_ROOT`, `COMFY_JOB_TIMEOUT`,
 `BUCKET_ENDPOINT_URL`, etc.) are unaffected -- `vast-entrypoint.sh` launches
 it exactly as today's RunPod CMD does, just with `--rp_serve_api` added.
+
+## Boot forensics (`boot-forensics.sh`)
+
+Serverless workers can't be SSH'd into -- no `dmesg`, no `free`, no
+`nvidia-smi` at the moment of a failure -- and when a container dies and
+restarts, `vastai logs` is reset, so the evidence for what killed it is
+destroyed by the thing that killed it. That's the standing blocker on the
+unexplained-container-restart investigation in `../../HANDOFF.md`
+(2026-08-27). That entry has **no evidenced cause** — an earlier version tied
+it to the 2026-08-24 long-clip failure and to host RAM, and both were wrong
+(the long-clip failure was a client-side idle TCP reap and is resolved). This
+script exists to ANSWER the question, not to confirm a theory: the cgroup
+`oom_kill` counter settles the RAM question in either direction.
+
+It only blocks tools *outside* the container. The numbers that settle it are
+readable from `/proc` and `/sys/fs/cgroup` with no privilege, so this script
+reads them from inside and prints them where `vastai logs` will show them.
+
+**Nothing to set up** -- it's `COPY`'d into the image and called by
+`vast-entrypoint.sh` before the model fetch. It needs a rebuild to appear on a
+worker; on an image without it the entrypoint prints one line and carries on.
+
+**What it gives you, in the boot banner:**
+
+| Line | Read it as |
+|---|---|
+| `BOOT #1` on an instance id you've seen before | container was **RECREATED** -- fresh writable layer. Explains a full ~40GB model re-fetch, and means `.has_benchmark` is gone. |
+| `BOOT #2`, `#3`, … | container was **RESTARTED** -- `/workspace` survived, so `backend.__run_benchmark` will skip the benchmark and reuse the **cached** `max_perf`. If workload units changed since, this worker is reporting perf in the old units. |
+| `cgroup oom_kill counter: <n>` non-zero | the kernel OOM-killed something in this cgroup. Host-RAM exhaustion, confirmed, in one number. |
+| `[forensics][prev] …` replay lines | the last ~40 memory samples from the run that died -- cgroup usage vs limit, `MemAvailable`, and the top-3 RSS processes, right up to the kill. |
+
+**Env knobs** (all optional, sane defaults):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FORENSICS_DIR` | `/workspace/.boot-forensics` | State dir. Must be on a path that survives a container restart for the counter and replay to mean anything. |
+| `FORENSICS_SAMPLE_INTERVAL` | `5` | Seconds between memory samples. |
+| `FORENSICS_REPLAY_LINES` | `40` | How many of the previous run's samples to replay at boot. |
+
+The sample log self-trims at 20k lines (~28h at 5s), so it can't grow into the
+disk ComfyUI needs.
+
+**Why it's called as a subprocess and not `source`d:** `vast-entrypoint.sh`
+runs under `set -euo pipefail`. `errexit` isn't inherited across fork+exec, so
+a subprocess call (each guarded with `|| true`) means nothing in a diagnostic
+can ever be the reason a worker fails to boot. The sampler still outlives it --
+it's backgrounded, orphaned when the script exits, and reparented to whatever
+becomes PID 1 after `exec /start_server.sh`.
 
 ## Design decisions and their tradeoffs (also documented inline in worker.py)
 

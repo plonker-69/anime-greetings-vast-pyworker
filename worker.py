@@ -115,8 +115,23 @@ MODEL_ERROR_LOG_MSGS = [
     # contain genuinely unrecoverable *worker*-health conditions -- a bad
     # job should fail and return an error, leaving the warm worker
     # available for the next request, not get the whole box destroyed.
-    "CUDA out of memory",
-    "torch.cuda.OutOfMemoryError",
+    # NOTE, 2026-08-29: "CUDA out of memory" and "torch.cuda.OutOfMemoryError"
+    # were removed from this list. They were the last two BARE substrings here
+    # -- i.e. the last place worker health was inferred from whatever text
+    # ComfyUI happened to print, which is the same mistake that cost a healthy
+    # worker on the KJNodes traceback above.
+    #
+    # Both were wrong in the common case. ComfyUI's model_management CATCHES
+    # OOM, frees models and retries, so a job that prints the string can still
+    # succeed -- and the worker would have been destroyed anyway. An oversized
+    # single job that genuinely OOMs should fail that job and leave the warm
+    # worker available for the next request, not take the box down.
+    #
+    # OOM is now classified in handler.py (_failure_is_worker_fatal): it calls
+    # ComfyUI's /free, then asks /system_stats whether ComfyUI is still
+    # serving. Only if it is not does it print the sentinel below. Health is
+    # decided from ComfyUI's API, and reaches this list as one explicit,
+    # unambiguous signal.
     # Explicit, deliberate sentinel handler.py prints from BOTH start_comfy()
     # call sites -- _boot_comfy_or_die (the eager initial-boot thread) and
     # handler(job)'s wrapped restart-on-request call -- whenever start_comfy()

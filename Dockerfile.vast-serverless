@@ -164,21 +164,30 @@ RUN git clone https://github.com/diodiogod/TTS-Audio-Suite.git custom_nodes/TTS-
  && git -C custom_nodes/TTS-Audio-Suite checkout 127bfe32fc83bedf36009ac35728098992460771 \
  && cd custom_nodes/TTS-Audio-Suite && python install.py
 
-# --- The five nodes with no pod-side git metadata: real repos, current
-# main HEAD (see Dockerfile's header comment for the full risk).
+# --- The five nodes that had no pod-side git metadata: pinned below to
+# the exact commits recovered from the last known-good :v2 image on
+# ghcr.io (docker pull :v2 + git rev-parse HEAD inside each
+# custom_nodes/<repo> dir), after a full local Docker cache wipe caused an
+# unpinned rebuild to silently pull fresh main HEAD for all five and broke
+# MultiTalkWav2VecEmbeds (NoneType error) on :v3. 2026-08-26.
 RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git custom_nodes/ComfyUI-WanVideoWrapper \
+ && git -C custom_nodes/ComfyUI-WanVideoWrapper checkout 088128b224242e110d3906c6750e9a3a348a659b \
  && python -m pip install --no-cache-dir -r custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
 
 RUN git clone https://github.com/kijai/ComfyUI-MelBandRoFormer.git custom_nodes/ComfyUI-MelBandRoFormer \
+ && git -C custom_nodes/ComfyUI-MelBandRoFormer checkout 92c86854e6654f4aacc97484471af95c98ea16d4 \
  && python -m pip install --no-cache-dir -r custom_nodes/ComfyUI-MelBandRoFormer/requirements.txt
 
 RUN git clone https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git custom_nodes/comfyui_fl-cosyvoice3 \
+ && git -C custom_nodes/comfyui_fl-cosyvoice3 checkout 39d3eeddb395e0ed805ef707db54017ee894171a \
  && python -m pip install --no-cache-dir -r custom_nodes/comfyui_fl-cosyvoice3/requirements.txt
 
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes \
+ && git -C custom_nodes/comfyui-kjnodes checkout 3f20054214fec9f9234fd3841ae6f1e4287948f6 \
  && python -m pip install --no-cache-dir -r custom_nodes/comfyui-kjnodes/requirements.txt
 
 RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git custom_nodes/comfyui-videohelpersuite \
+ && git -C custom_nodes/comfyui-videohelpersuite checkout 4ee72c065db22c9d96c2427954dc69e7b908444b \
  && python -m pip install --no-cache-dir -r custom_nodes/comfyui-videohelpersuite/requirements.txt
 
 # This worker is headless and API-driven — it never uses ComfyUI-Manager's
@@ -186,6 +195,17 @@ RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git custom
 # waste. Confirmed on RunPod: ~2 minutes of every cold start.
 RUN mkdir -p user/__manager && \
     printf '[default]\nnetwork_mode = offline\n' > user/__manager/config.ini
+
+# --- transformers: pinned to the exact version confirmed working on :v2 ---
+# None of the custom nodes above pin their own `transformers` requirement,
+# so a genuinely fresh build (cache wiped, no layer to reuse) resolves it to
+# whatever's newest on PyPI at that moment. Confirmed drift: 5.15.0 (:v2,
+# working) -> 5.16.1 (:v4, broke MultiTalkWav2VecEmbeds with a NoneType
+# error) despite identical custom-node commits and identical torch/
+# torchaudio (those come from the base image, unaffected). This RUN must
+# stay AFTER all custom-node installs above so it overrides whatever
+# version any of their requirements.txt pulled in. 2026-08-27.
+RUN python -m pip install --no-cache-dir "transformers==5.15.0"
 
 # --- Model weights: NOT baked in, on purpose -------------------------------
 # Same as Dockerfile.lightweight — this is the entire point of the
@@ -204,7 +224,7 @@ RUN mkdir -p user/__manager && \
 RUN python -m pip install --no-cache-dir "huggingface_hub>=0.32.0"
 ENV HF_XET_HIGH_PERFORMANCE=1
 
-RUN pip install --no-cache-dir runpod
+RUN pip install --no-cache-dir runpod boto3
 
 COPY handler.py /handler.py
 COPY workflow_api.json /workflow_api.json
@@ -238,7 +258,13 @@ COPY log-timestamps.py /log-timestamps.py
 # for the full boot sequence it runs.
 COPY serverless/vast_pyworker/start_server.sh /start_server.sh
 COPY serverless/vast_pyworker/vast-entrypoint.sh /vast-entrypoint.sh
-RUN chmod +x /start_server.sh /vast-entrypoint.sh
+# Boot forensics: boot counter (restart vs recreate), cgroup OOM-kill counter,
+# and a background memory sampler whose previous-run tail is replayed at the
+# next boot -- the only way to see the seconds before a silent container death,
+# since serverless workers can't be SSH'd into and the reboot resets stdout.
+# Invoked from vast-entrypoint.sh, guarded so it can never fail a boot.
+COPY serverless/vast_pyworker/boot-forensics.sh /boot-forensics.sh
+RUN chmod +x /start_server.sh /vast-entrypoint.sh /boot-forensics.sh
 
 ENTRYPOINT ["/vast-entrypoint.sh"]
 CMD []
