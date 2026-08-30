@@ -104,37 +104,89 @@ fi
 
 LOG_DIR="/var/log/vast-pyworker"
 mkdir -p "$LOG_DIR"
+# ⚠️ worker.py tails ONE file -- MODEL_LOG_FILE, hardcoded to
+# $LOG_DIR/handler.log -- and that single stream is how it learns the worker is
+# ready (MODEL_LOAD_LOG_MSG) and how it detects a dead worker
+# (MODEL_ERROR_LOG_MSGS / FATAL_WORKER). EVERY process whose output worker.py
+# must see has to append to THIS file, whatever else it also writes to.
+#
+# Broke exactly this on 2026-08-30: the multi-GPU change gave each handler its
+# own handler.$i.log and the router router.log, so nothing wrote handler.log at
+# all. ComfyUI booted fine, the router printed the readiness sentinel to
+# router.log, worker.py saw an empty file, never marked the model loaded, never
+# ran the benchmark, and the worker hung silently forever. Per-process logs are
+# for humans; handler.log is the contract.
+COMBINED_LOG="$LOG_DIR/handler.log"
+touch "$COMBINED_LOG"
 
-echo "[vast-entrypoint] starting handler.py in --rp_serve_api mode"
-# Note: output is duplicated to both the log file AND this container's own
-# stdout (via process substitution + tee, not a plain pipe -- a plain pipe
-# would make $! below capture tee's PID instead of handler.py's, breaking
-# the immediate-crash check right after this). This is deliberate: worker.py
-# only relays specific whitelisted log-line patterns from handler.log into
-# `vastai logs` (its own "Info from model logs:" / "Got log line indicating
-# error:" wrapper), which silently swallows anything else -- including a
-# real Python traceback's actual stack frames, past the first "Traceback
-# (most recent call last):" line. Tee-ing straight to stdout means
-# `vastai logs <instance_id>` shows the raw, complete output no matter what
-# worker.py does or doesn't forward -- see HANDOFF.md, 2026-08-16.
-python3 -u /handler.py \
-    --rp_serve_api \
-    --rp_api_host 127.0.0.1 \
-    --rp_api_port 8000 \
-    > >(tee -a "$LOG_DIR/handler.log") 2>&1 &
-HANDLER_PID=$!
-echo "[vast-entrypoint] handler.py pid=$HANDLER_PID, logging to $LOG_DIR/handler.log"
-
-# If handler.py's API server dies outright (crash before ComfyUI even
-# starts, e.g. a port conflict), fail fast and loudly instead of leaving
-# worker.py to wait forever for a "[handler] ComfyUI is up" line that will
-# never come.
-sleep 2
-if ! kill -0 "$HANDLER_PID" 2>/dev/null; then
-    echo "[vast-entrypoint] FATAL: handler.py exited immediately -- see $LOG_DIR/handler.log" >&2
-    tail -n 100 "$LOG_DIR/handler.log" >&2 || true
-    exit 1
+# --- One handler.py + one ComfyUI per GPU, behind router.py -----------------
+#
+# NUM_GPU_WORKERS is auto-detected from the box, so ONE image serves the 1x,
+# 2x and 4x workergroups with no rebuild and no per-group tag. Override with
+# the env var to under-subscribe a box deliberately.
+#
+# ⚠️ The binding constraint is SYSTEM RAM, not GPU count. The workflow keeps
+# the transformer in CPU memory on purpose (node 122 load_device:
+# offload_device), so each ComfyUI holds roughly 20-30GB of host RAM. Size the
+# workergroup's `cpu_ram` filter accordingly -- the 1x group's `cpu_ram>=64`
+# is sized for ONE. Getting this wrong looks exactly like the unexplained
+# container restarts (HANDOFF.md, 2026-08-27), so do not confuse the two.
+NUM_GPU_WORKERS="${NUM_GPU_WORKERS:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}"
+if [ -z "$NUM_GPU_WORKERS" ] || [ "$NUM_GPU_WORKERS" -lt 1 ] 2>/dev/null; then
+    echo "[vast-entrypoint] WARNING: could not detect GPUs -- assuming 1"
+    NUM_GPU_WORKERS=1
 fi
+export NUM_GPU_WORKERS
+echo "[vast-entrypoint] launching $NUM_GPU_WORKERS handler(s), one per GPU"
+
+# Output is duplicated to both the log file AND this container's own stdout
+# (via process substitution + tee, not a plain pipe -- a plain pipe would make
+# $! capture tee's PID instead of the handler's, breaking the immediate-crash
+# check below). Deliberate: worker.py only relays specific whitelisted log-line
+# patterns from handler.log into `vastai logs`, silently swallowing everything
+# else -- including a real traceback's stack frames past the first line.
+# Tee-ing straight to stdout means `vastai logs <instance_id>` shows the raw,
+# complete output regardless -- see HANDOFF.md, 2026-08-16.
+HANDLER_PIDS=""
+i=0
+while [ "$i" -lt "$NUM_GPU_WORKERS" ]; do
+    # Each handler owns exactly one GPU, one ComfyUI port, and its own input/
+    # output dirs. The dirs are NOT cosmetic: write_input_files() writes the
+    # incoming portrait/voice under names the workflow hardcodes, so a shared
+    # input/ would let two concurrent jobs overwrite each other's portrait and
+    # deliver a video of the wrong person with no error raised.
+    CUDA_VISIBLE_DEVICES="$i"     COMFY_PORT="$((8188 + i))"     COMFY_READY_FILE="/tmp/comfy-ready.$((8188 + i))"     COMFY_INPUT_DIR="/tmp/comfy-input-$i"     COMFY_OUTPUT_DIR="/tmp/comfy-output-$i"     python3 -u /handler.py         --rp_serve_api         --rp_api_host 127.0.0.1         --rp_api_port "$((8001 + i))"         > >(tee -a "$COMBINED_LOG" "$LOG_DIR/handler.$i.log") 2>&1 &
+    HANDLER_PIDS="$HANDLER_PIDS $!"
+    echo "[vast-entrypoint] handler[$i] pid=$! gpu=$i comfy_port=$((8188 + i)) api_port=$((8001 + i)) log=$LOG_DIR/handler.$i.log"
+    i=$((i + 1))
+done
+
+# router.py owns :8000 -- the single address PyWorker forwards to
+# (WorkerConfig model_server_port). It hands each job to whichever handler is
+# free, and prints the "[handler] ComfyUI is up" readiness sentinel only once
+# EVERY backend has written its /tmp/comfy-ready.<port> marker. NOT once the
+# API ports answer -- those answer at t=0 while ComfyUI is still loading
+# weights (~54s), which would mark the box ready far too early. It runs for
+# NUM_GPU_WORKERS=1 too: one code path, no single-GPU special case.
+# Clear stale readiness markers before the router starts looking for them.
+# handler.py also removes its own before each (re)launch; this covers a
+# container whose /tmp survived from an earlier boot.
+rm -f /tmp/comfy-ready.* 2>/dev/null || true
+python3 -u /router.py > >(tee -a "$COMBINED_LOG" "$LOG_DIR/router.log") 2>&1 &
+ROUTER_PID=$!
+echo "[vast-entrypoint] router.py pid=$ROUTER_PID on :8000, logging to $LOG_DIR/router.log"
+
+# Fail fast and loudly if anything died on the spot (a port conflict, a bad
+# import), instead of leaving worker.py waiting forever for a readiness line
+# that will never come.
+sleep 2
+for p in $HANDLER_PIDS $ROUTER_PID; do
+    if ! kill -0 "$p" 2>/dev/null; then
+        echo "[vast-entrypoint] FATAL: pid $p exited immediately -- see $LOG_DIR/" >&2
+        tail -n 100 "$LOG_DIR"/handler.*.log "$LOG_DIR"/router.log 2>/dev/null >&2 || true
+        exit 1
+    fi
+done
 
 echo "[vast-entrypoint] handing off to start_server.sh (worker.py bootstrap)"
 exec /start_server.sh

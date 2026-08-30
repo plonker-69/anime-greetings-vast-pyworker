@@ -264,7 +264,11 @@ COPY serverless/vast_pyworker/vast-entrypoint.sh /vast-entrypoint.sh
 # since serverless workers can't be SSH'd into and the reboot resets stdout.
 # Invoked from vast-entrypoint.sh, guarded so it can never fail a boot.
 COPY serverless/vast_pyworker/boot-forensics.sh /boot-forensics.sh
-RUN chmod +x /start_server.sh /vast-entrypoint.sh /boot-forensics.sh
+# router.py: the single address PyWorker forwards to (:8000), fanning out to
+# one handler.py + one ComfyUI per GPU. Runs for 1-GPU boxes too -- one code
+# path. Stdlib only, no extra pip install. 2026-08-30.
+COPY serverless/vast_pyworker/router.py /router.py
+RUN chmod +x /start_server.sh /vast-entrypoint.sh /boot-forensics.sh /router.py
 
 ENTRYPOINT ["/vast-entrypoint.sh"]
 CMD []
