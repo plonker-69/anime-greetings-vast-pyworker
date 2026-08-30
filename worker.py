@@ -55,6 +55,11 @@ from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, Benchma
 # --- handler.py's local server (env-overridable to match start_model_server.sh) ---
 MODEL_SERVER_URL  = os.environ.get("PYWORKER_MODEL_SERVER_URL", "http://127.0.0.1")
 MODEL_SERVER_PORT = int(os.environ.get("PYWORKER_MODEL_SERVER_PORT", "8000"))
+
+# Number of GPUs this box serves, one handler.py + one ComfyUI each, behind
+# router.py on MODEL_SERVER_PORT. Set by vast-entrypoint.sh from `nvidia-smi
+# -L`, so one image serves the 1x/2x/4x workergroups with no rebuild.
+NUM_GPU_WORKERS = int(os.environ.get("NUM_GPU_WORKERS", "1"))
 MODEL_LOG_FILE    = os.environ.get(
     "PYWORKER_MODEL_LOG_FILE", "/var/log/vast-pyworker/handler.log"
 )
@@ -218,7 +223,15 @@ worker_config = WorkerConfig(
             # once -- concurrent write_input_files() calls alone would
             # clobber each other. Requests FIFO-queue in the PyWorker
             # instead of running in parallel.
-            allow_parallel_requests=False,
+            # False on a 1-GPU box (unchanged behaviour: requests FIFO-queue
+            # in the PyWorker), True when router.py has more than one backend
+            # to hand them to. The comment above describes the single-GPU
+            # reason this was False -- concurrent write_input_files() calls
+            # clobbering each other, and one ComfyUI that cannot take two
+            # jobs. Both are now handled a layer down: each handler owns its
+            # OWN ComfyUI, its OWN input/output dirs and its OWN flock, and
+            # router.py hands a job only to a backend that is idle. 2026-08-30.
+            allow_parallel_requests=NUM_GPU_WORKERS > 1,
             # Governs admission, not a per-request timer: PyWorker rejects
             # (HTTP 429) new requests once *estimated* wait time -- queued
             # workload / measured throughput -- exceeds this. Each job
@@ -231,12 +244,25 @@ worker_config = WorkerConfig(
             benchmark_config=BenchmarkConfig(
                 generator=_make_benchmark_payload,
                 runs=1,
-                # allow_parallel_requests=False above forces the
-                # benchmark's own concurrency to 1 regardless of this
-                # value (see vastai's backend.__run_benchmark) -- set
-                # explicitly anyway so the intent survives an SDK version
-                # bump.
-                concurrency=1,
+                # Must match the number of backends, and this is what makes
+                # a multi-GPU box report HONEST capacity.
+                # backend.__run_benchmark computes
+                #   max_throughput = total_workload / time_elapsed
+                # so N concurrent benchmark jobs at workload 10000 each,
+                # finishing in T, report N*10000/T instead of 10000/T. The
+                # autoscaler therefore learns the box is worth N workers by
+                # MEASUREMENT, with no hand-set multiplier to drift out of
+                # sync -- which is exactly how the cost/workload_calculator
+                # mismatch happened (see the note on workload_calculator
+                # below). Leave the two coupled.
+                #
+                # Note this only takes effect with allow_parallel_requests
+                # True; while it is False, vastai forces benchmark
+                # concurrency to 1 regardless of this value.
+                #
+                # Cold start becomes 2N generations (do_warmup) but they run
+                # in parallel, so wall-clock is roughly unchanged.
+                concurrency=NUM_GPU_WORKERS,
                 # True (default) = one warmup generation (real model load
                 # into VRAM, slow) + one measured generation, i.e. TWO
                 # full video generations before this worker is marked
