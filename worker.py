@@ -157,6 +157,73 @@ MODEL_INFO_LOG_MSGS = [
     "[handler] WARNING",
 ]
 
+
+# --- TTS-Audio-Suite CosyVoice3: two node packs, ONE copy of the weights ---
+# The 11 shared files + llm.pt that TTS-Audio-Suite verifies before it decides
+# whether to download. Read off the pinned commit (127bfe32,
+# engines/cosyvoice/cosyvoice_downloader.py: SHARED_FILES / _verify_model),
+# not guessed -- if this list drifts from theirs the check below silently
+# stops protecting anything.
+TTS_SUITE_REQUIRED = (
+    "cosyvoice3.yaml", "campplus.onnx", "flow.pt", "hift.pt",
+    "speech_tokenizer_v3.onnx", "llm.pt",
+    "CosyVoice-BlankEN/config.json", "CosyVoice-BlankEN/generation_config.json",
+    "CosyVoice-BlankEN/merges.txt", "CosyVoice-BlankEN/model.safetensors",
+    "CosyVoice-BlankEN/tokenizer_config.json", "CosyVoice-BlankEN/vocab.json",
+)
+
+
+def link_tts_audio_suite_model(models_root):
+    """Point models/TTS/CosyVoice/Fun-CosyVoice3-0.5B at the CosyVoice3 copy
+    the boot fetch already pulled for comfyui_fl-cosyvoice3
+    (models/cosyvoice/), so TTS-Audio-Suite's CosyVoiceEngineNode resolves
+    without downloading a second ~5.4GB copy of the same HuggingFace repo.
+
+    WHY THIS LIVES HERE, of all places: this file is the ONE artefact on the
+    worker that deploys by `git push` to PYWORKER_REPO rather than by a
+    ~41GB docker build -- start_server.sh re-clones it at every container
+    boot. fetch-models.py holds the same function and is where it belongs,
+    but that is in the image, so on the currently-live tag the link does not
+    exist. Calling it here makes the merged TTS+I2V+upscale graph
+    (workflow_api_full.json) runnable on the live image today, and keeps
+    working afterwards as a no-op once the image carries the link itself.
+
+    Runs at import, which is before the startup benchmark -- i.e. before any
+    job, including the one the benchmark itself sends. TTS-Audio-Suite
+    resolves the model path at NODE EXECUTION time, not at ComfyUI startup,
+    so a link created after ComfyUI has already booted is still picked up.
+
+    Best-effort, never raises: a missing link costs a slow first job, which
+    is not a reason to fail a worker boot. Keep in step with the copies in
+    ../../fetch-models.py, ../../download-models.py and
+    ../../download-models-runtime.py.
+    """
+    import os
+    from pathlib import Path
+
+    source = Path(models_root) / "cosyvoice" / "Fun-CosyVoice3-0.5B"
+    target = Path(models_root) / "TTS" / "CosyVoice" / "Fun-CosyVoice3-0.5B"
+    try:
+        if target.is_symlink() or target.exists():
+            where = os.readlink(target) if target.is_symlink() else "real directory"
+            print(f"[tts-link] {target} already present ({where}) -- leaving it alone")
+            return
+        missing = [f for f in TTS_SUITE_REQUIRED if not (source / f).exists()]
+        if missing:
+            print(f"[tts-link] NOT linking: {source} is missing {missing} -- "
+                  "TTS-Audio-Suite will self-download its own copy on first use")
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.path.relpath(source, target.parent), target)
+        print(f"[tts-link] {target} -> {os.path.relpath(source, target.parent)} "
+              "(TTS-Audio-Suite now reuses the fl-cosyvoice3 weights)")
+    except Exception as e:
+        print(f"[tts-link] WARNING: could not link the TTS-Audio-Suite model copy: {e}")
+
+# Runs at import: before the benchmark, therefore before any job.
+link_tts_audio_suite_model(
+    os.path.join(os.environ.get("COMFY_ROOT", "/workspace/ComfyUI"), "models"))
+
 # Real production request: one portrait + one voice clip -> InfiniteTalk +
 # CosyVoice video. Used both as the "does this box actually work" boot
 # check and as the throughput sample -- same tradeoff Vast's own Wan 2.2
