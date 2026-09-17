@@ -159,10 +159,6 @@ RUN git clone https://github.com/ltdrdata/ComfyUI-Manager.git custom_nodes/comfy
  && git -C custom_nodes/comfyui-manager checkout ab8ce7814aa1cd4f9a88b7b0313f64395f132972 \
  && python -m pip install --no-cache-dir -r custom_nodes/comfyui-manager/requirements.txt
 
-# --- TTS-Audio-Suite: pinned commit, real installer (not bare pip install)
-RUN git clone https://github.com/diodiogod/TTS-Audio-Suite.git custom_nodes/TTS-Audio-Suite \
- && git -C custom_nodes/TTS-Audio-Suite checkout 127bfe32fc83bedf36009ac35728098992460771 \
- && cd custom_nodes/TTS-Audio-Suite && python install.py
 
 # --- The five nodes that had no pod-side git metadata: pinned below to
 # the exact commits recovered from the last known-good :v2 image on
@@ -174,13 +170,17 @@ RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git custom_nodes/
  && git -C custom_nodes/ComfyUI-WanVideoWrapper checkout 088128b224242e110d3906c6750e9a3a348a659b \
  && python -m pip install --no-cache-dir -r custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
 
+# --- TTS node packs REMOVED 2026-09-15 -------------------------------
+# TTS-Audio-Suite and comfyui_fl-cosyvoice3 used to be cloned here. TTS
+# left ComfyUI when CosyVoice was retired for Fish Speech S2-Pro on its
+# own always-on Vast instance (see ../../vast image/README.md); this
+# image now receives a finished mp3 and only animates it. Removing them
+# also removes the models/TTS/CosyVoice symlink problem entirely.
+# MelBandRoFormer stays -- vocal isolation for lipsync still runs here.
 RUN git clone https://github.com/kijai/ComfyUI-MelBandRoFormer.git custom_nodes/ComfyUI-MelBandRoFormer \
  && git -C custom_nodes/ComfyUI-MelBandRoFormer checkout 92c86854e6654f4aacc97484471af95c98ea16d4 \
  && python -m pip install --no-cache-dir -r custom_nodes/ComfyUI-MelBandRoFormer/requirements.txt
 
-RUN git clone https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git custom_nodes/comfyui_fl-cosyvoice3 \
- && git -C custom_nodes/comfyui_fl-cosyvoice3 checkout 39d3eeddb395e0ed805ef707db54017ee894171a \
- && python -m pip install --no-cache-dir -r custom_nodes/comfyui_fl-cosyvoice3/requirements.txt
 
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes \
  && git -C custom_nodes/comfyui-kjnodes checkout 3f20054214fec9f9234fd3841ae6f1e4287948f6 \
@@ -228,6 +228,24 @@ RUN pip install --no-cache-dir runpod boto3
 
 COPY handler.py /handler.py
 COPY workflow_api.json /workflow_api.json
+
+# --- 1080p upscale ----------------------------------------------------------
+# upscale.py must sit next to /handler.py -- sys.path[0] is / for
+# `python -u /handler.py`, which is how `import upscale` resolves.
+COPY upscale.py /upscale.py
+# Weights baked in (2.4MB): realesr-animevideov3, Real-ESRGAN, BSD-3-Clause.
+# Image-local rather than under COMFY_ROOT on purpose -- that is the shared
+# network volume and concurrent workers would race writing it. Fetched with
+# python (no curl/wget in this image) and hash-checked here so a changed
+# upstream file fails the BUILD rather than shipping silently.
+RUN mkdir -p /opt/upscale && python -c "\
+import hashlib, sys, urllib.request; \
+u='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth'; \
+p='/opt/upscale/realesr-animevideov3.pth'; \
+urllib.request.urlretrieve(u, p); \
+h=hashlib.sha256(open(p,'rb').read()).hexdigest(); \
+want='b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d'; \
+sys.exit('upscale weights sha256 mismatch: '+h) if h!=want else print('upscale weights ok', h)"
 
 ENV COMFY_ROOT=/workspace/ComfyUI
 ENV COMFY_SKIP_REQ_SYNC=1

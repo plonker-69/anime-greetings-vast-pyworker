@@ -129,6 +129,13 @@ docker build --platform linux/amd64 \
   .
 ```
 
+⚠️ **The tag in that example is v1 — check what's actually live before you
+build.** As of 2026-09-11 the current tag is **v9**, so the next build is v10.
+HISTORY.md's newest recorded build is v7; v8 and v9 were pushed without being
+written down, and reading the tag out of the docs instead of off the endpoint
+has already produced one wrong build command. `vastai show endpoints --raw` or
+the workergroup's image field is the source of truth, not this file.
+
 No `--build-arg` needed -- this is now a complete, standalone image build,
 same as `docker build -f Dockerfile.lightweight-blackwell ...` for the
 RunPod line. Needs a rented Blackwell card (RTX 5090 / B100 / B200) to

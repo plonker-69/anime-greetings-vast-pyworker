@@ -241,12 +241,16 @@ with open(_BENCHMARK_PAYLOAD_PATH) as _f:
 # graph changes (both templates are kept in lockstep, see that file's
 # module docstring).
 _BENCHMARK_SAMPLER_NODE = "128"  # WanVideoSampler
-_BENCHMARK_TTS_NODE = "318"      # FL_CosyVoice3_CrossLingual
+# There is no TTS node any more. CosyVoice was retired on 2026-09-15 and speech
+# comes from the Fish Speech S2-Pro instance, so benchmark_payload.json is the
+# real-audio graph and _BENCHMARK_TTS_NODE ("318", FL_CosyVoice3_CrossLingual)
+# is gone with it. Seeding a node that no longer exists would KeyError on every
+# benchmark, i.e. on every worker boot.
 
 
 def _make_benchmark_payload() -> dict:
-    """Fresh copy of the benchmark request with a new random seed on both
-    samplers, every call.
+    """Fresh copy of the benchmark request with a new random sampler seed,
+    every call.
 
     HANDOFF.md bug this fixes ("Fix the Vast benchmark before it serves
     real traffic"): ComfyUI caches node outputs by input hash within the
@@ -255,8 +259,8 @@ def _make_benchmark_payload() -> dict:
     the "measured" run Vast's autoscaler uses to size this worker's
     throughput. With a static payload (the old `dataset=[_benchmark_request]`
     below) the second submission is byte-for-byte identical to the first,
-    so WanVideoSampler and the CosyVoice node just replay their cached
-    output instead of generating -- the measured run clocked in ~41x
+    so WanVideoSampler just replays its cached output instead of
+    generating -- the measured run clocked in ~41x
     faster than a real request, and the autoscaler never scaled the fleet
     up under load.
 
@@ -264,7 +268,7 @@ def _make_benchmark_payload() -> dict:
     function called fresh for every submission, warmup included (see
     vastai's GenericApiPayload.for_test(): `dataset` is drawn from via
     random.choice -- a fixed pool that can and does repeat -- `generator`
-    is invoked new each time). Randomizing both seeds on every call
+    is invoked new each time). Randomizing the sampler seed on every call
     guarantees no two submissions in one boot share a seed, so the
     "measured" run always does a real, cache-miss generation -- matching
     how worker/workflow.py's build_workflow() already randomizes seeds for
@@ -273,7 +277,6 @@ def _make_benchmark_payload() -> dict:
     payload = copy.deepcopy(_benchmark_request)
     workflow = payload["input"]["workflow"]
     workflow[_BENCHMARK_SAMPLER_NODE]["inputs"]["seed"] = random.randrange(2**31)
-    workflow[_BENCHMARK_TTS_NODE]["inputs"]["seed"] = random.randrange(2**31)
     return payload
 
 worker_config = WorkerConfig(
